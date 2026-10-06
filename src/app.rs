@@ -10,7 +10,6 @@
 // Platform and Runtime Libraries
 // =============================================================================
 
-use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -60,8 +59,8 @@ pub struct PingApp {
         _stopElapsedSecs: Option<f64>,
         _totalRecords: usize,
         _statsAccumulator: StatsAccumulator,
-        _latencyPoints: VecDeque<PlotPoint>,
-        _timeoutPoints: VecDeque<PlotPoint>,
+        _latencyPoints: Vec<PlotPoint>,
+        _timeoutPoints: Vec<PlotPoint>,
         _maxPing: f64,
         _resolutionRx: Option<Receiver<Result<(String, IpAddr), String>>>,
         _resolvingTarget: Option<String>,
@@ -101,8 +100,8 @@ impl Default for PingApp {
                         _stopElapsedSecs: None,
                         _totalRecords: 0,
                         _statsAccumulator: StatsAccumulator::default(),
-                        _latencyPoints: VecDeque::new(),
-                        _timeoutPoints: VecDeque::new(),
+                        _latencyPoints: Vec::new(),
+                        _timeoutPoints: Vec::new(),
                         _maxPing: 0.0,
                         _resolutionRx: None,
                         _resolvingTarget: None,
@@ -248,12 +247,12 @@ impl PingApp {
                         / 1000.0;
                 if let Some(ms) = record.getPingMs() {
                         self._maxPing = self._maxPing.max(ms);
-                        PushBounded(
+                        PushDownsampled(
                                 &mut self._latencyPoints,
                                 PlotPoint::new(elapsed.max(0.0), ms),
                         );
                 } else if record.isTimeout() {
-                        PushBounded(
+                        PushDownsampled(
                                 &mut self._timeoutPoints,
                                 PlotPoint::new(elapsed.max(0.0), 0.0),
                         );
@@ -772,7 +771,7 @@ impl PingApp {
         }
 
         // Render interactive latency graph pinned at (0, 0) with autoscaling.
-        fn RenderPlot(&mut self, ui: &mut egui::Ui) {
+        fn RenderPlot(&self, ui: &mut egui::Ui) {
                 let avail_h = ui.available_height().max(250.0);
                 let start_utc = self._startTimeUtc.unwrap_or_else(Utc::now);
 
@@ -786,8 +785,8 @@ impl PingApp {
 
                 let x_max = elapsed_now.max(DEFAULT_GRID_TIME_SECS);
                 let y_max = (self._maxPing * 1.05).max(DEFAULT_GRID_PING_MS);
-                let latency_points = self._latencyPoints.make_contiguous();
-                let timeout_points = self._timeoutPoints.make_contiguous();
+                let latency_points = self._latencyPoints.as_slice();
+                let timeout_points = self._timeoutPoints.as_slice();
                 let has_latency = !latency_points.is_empty();
                 let has_timeouts = !timeout_points.is_empty();
 
@@ -904,11 +903,17 @@ fn EnsureCsvExtension(mut path: PathBuf) -> PathBuf {
         path
 }
 
-fn PushBounded<T>(items: &mut VecDeque<T>, item: T) {
-        if items.len() == MAX_PLOT_POINTS {
-                items.pop_front();
+fn PushDownsampled<T>(items: &mut Vec<T>, item: T) {
+        if items.len() >= MAX_PLOT_POINTS {
+                let last = items.len() - 1;
+                let mut index = 0;
+                items.retain(|_| {
+                        let keep = index % 2 == 0 || index == last;
+                        index += 1;
+                        keep
+                });
         }
-        items.push_back(item);
+        items.push(item);
 }
 
 #[cfg(test)]
@@ -932,5 +937,15 @@ mod tests {
                         EnsureCsvExtension(PathBuf::from("results.txt")),
                         PathBuf::from("results.csv")
                 );
+        }
+
+        #[test]
+        fn plot_history_downsamples_at_limit() {
+                let mut points = Vec::new();
+                for index in 0..=MAX_PLOT_POINTS {
+                        PushDownsampled(&mut points, index);
+                }
+                assert!(points.len() < MAX_PLOT_POINTS);
+                assert_eq!(points.last(), Some(&MAX_PLOT_POINTS));
         }
 }
