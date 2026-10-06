@@ -9,3 +9,8 @@ eframe = "0.36.2"
 egui_plot = "0.37.0"
 pinger = "2.2.0"
 rfd = "0.17.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
