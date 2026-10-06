@@ -10,8 +10,11 @@
 // Platform and Runtime Libraries
 // =============================================================================
 
+use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::Duration;
 
 // =============================================================================
@@ -20,15 +23,17 @@ use std::time::Duration;
 
 use chrono::{DateTime, Local, Utc};
 use eframe::egui::{self, Color32, FontId, RichText, Stroke, Vec2};
-use egui_plot::{Legend, Line, Plot, PlotBounds, PlotPoints, Points};
+use egui_plot::{
+        Legend, Line, Plot, PlotBounds, PlotPoint, PlotPoints, Points,
+};
 
 // =============================================================================
 // Domain Modules
 // =============================================================================
 
 use crate::ping::{
-        CalculateStats, ExportRecordsToCsv, PingRecord, PingSession, PingStats,
-        ResolveTarget,
+        ExportSessionCsv, PingRecord, PingSession, PingStats, ResolveTarget,
+        SessionEvent, StatsAccumulator, ValidateTargetSyntax,
 };
 
 // =============================================================================
@@ -53,8 +58,17 @@ pub struct PingApp {
         _session: Option<PingSession>,
         _startTimeUtc: Option<DateTime<Utc>>,
         _stopElapsedSecs: Option<f64>,
-        _collectedRecords: Vec<PingRecord>,
+        _collectedRecords: VecDeque<PingRecord>,
+        _totalRecords: usize,
         _lastStats: PingStats,
+        _statsAccumulator: StatsAccumulator,
+        _latencyPoints: VecDeque<PlotPoint>,
+        _timeoutPoints: VecDeque<PlotPoint>,
+        _maxPing: f64,
+        _resolutionRx: Option<Receiver<Result<(String, IpAddr), String>>>,
+        _resolvingTarget: Option<String>,
+        _pendingStart: bool,
+        _workerError: Option<String>,
         _saveStatusMsg: Option<(String, bool)>,
         _lastSavedPath: Option<PathBuf>,
 }
@@ -70,6 +84,8 @@ const MAX_INTERVAL_SECS: f64 = 60.0;
 const STEP_INTERVAL_SECS: f64 = 0.5;
 const DEFAULT_GRID_TIME_SECS: f64 = 60.0;
 const DEFAULT_GRID_PING_MS: f64 = 100.0;
+const MAX_LIVE_RECORDS: usize = 10_000;
+const MAX_PLOT_POINTS: usize = 5_000;
 
 // =============================================================================
 // Constructors and Initializers
@@ -87,8 +103,17 @@ impl Default for PingApp {
                         _session: None,
                         _startTimeUtc: None,
                         _stopElapsedSecs: None,
-                        _collectedRecords: Vec::new(),
+                        _collectedRecords: VecDeque::new(),
+                        _totalRecords: 0,
                         _lastStats: PingStats::default(),
+                        _statsAccumulator: StatsAccumulator::default(),
+                        _latencyPoints: VecDeque::new(),
+                        _timeoutPoints: VecDeque::new(),
+                        _maxPing: 0.0,
+                        _resolutionRx: None,
+                        _resolvingTarget: None,
+                        _pendingStart: false,
+                        _workerError: None,
                         _saveStatusMsg: None,
                         _lastSavedPath: None,
                 }
@@ -109,7 +134,7 @@ impl PingApp {
 impl eframe::App for PingApp {
         // Render application user interface frame.
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-                self.RefreshSessionData(ui);
+                self.RefreshSessionData(ui.ctx());
 
                 egui::Frame::central_panel(ui.style()).show(ui, |ui| {
                         RenderHeader(ui);
@@ -131,63 +156,193 @@ impl eframe::App for PingApp {
 }
 
 impl PingApp {
-        // Update records and request repaint when test is running.
-        fn RefreshSessionData(&mut self, ui: &mut egui::Ui) {
-                if self._state != AppState::Running {
-                        return;
+        fn RefreshSessionData(&mut self, ctx: &egui::Context) {
+                if let Some(receiver) = &self._resolutionRx {
+                        match receiver.try_recv() {
+                                Ok(result) => {
+                                        self._resolutionRx = None;
+                                        let target =
+                                                self._resolvingTarget.take();
+                                        if target.as_deref()
+                                                != Some(self
+                                                        ._targetInput
+                                                        .trim())
+                                        {
+                                                self._pendingStart = false;
+                                        } else {
+                                                match result {
+                                                        Ok((_, ip)) => {
+                                                                self._resolvedIp =
+                                                                        Some(ip);
+                                                                self._resolutionError =
+                                                                        None;
+                                                                if self._pendingStart {
+                                                                        self._pendingStart =
+                                                                                false;
+                                                                        self.StartResolvedTest(
+                                                                                ip,
+                                                                                ctx.clone(),
+                                                                        );
+                                                                }
+                                                        }
+                                                        Err(error) => {
+                                                                self._resolvedIp =
+                                                                        None;
+                                                                self._resolutionError =
+                                                                        Some(error);
+                                                                self._pendingStart =
+                                                                        false;
+                                                        }
+                                                }
+                                        }
+                                }
+                                Err(TryRecvError::Disconnected) => {
+                                        self._resolutionRx = None;
+                                        self._resolvingTarget = None;
+                                        self._pendingStart = false;
+                                        self._resolutionError = Some(
+                                                "Address resolution worker stopped unexpectedly."
+                                                        .to_string(),
+                                        );
+                                }
+                                Err(TryRecvError::Empty) => {}
+                        }
                 }
 
+                let mut events = Vec::new();
                 if let Some(session) = &self._session {
-                        self._collectedRecords = session.getRecords();
-                        self._lastStats =
-                                CalculateStats(&self._collectedRecords);
+                        loop {
+                                match session.tryRecv() {
+                                        Ok(event) => events.push(event),
+                                        Err(TryRecvError::Empty)
+                                        | Err(TryRecvError::Disconnected) => {
+                                                break;
+                                        }
+                                }
+                        }
                 }
-                ui.ctx().request_repaint_after(Duration::from_millis(50));
+                for event in events {
+                        match event {
+                                SessionEvent::Record(record) => {
+                                        self._totalRecords += 1;
+                                        self._statsAccumulator.push(&record);
+                                        self._lastStats = self
+                                                ._statsAccumulator
+                                                .snapshot();
+                                        let start = self
+                                                ._startTimeUtc
+                                                .unwrap_or_else(Utc::now);
+                                        let elapsed = (record.getTimestamp()
+                                                - start)
+                                                .num_milliseconds()
+                                                as f64
+                                                / 1000.0;
+                                        if let Some(ms) = record.getPingMs() {
+                                                self._maxPing =
+                                                        self._maxPing.max(ms);
+                                                PushBounded(
+                                                        &mut self
+                                                                ._latencyPoints,
+                                                        PlotPoint::new(
+                                                                elapsed.max(
+                                                                        0.0,
+                                                                ),
+                                                                ms,
+                                                        ),
+                                                );
+                                        } else if record.isTimeout() {
+                                                PushBounded(
+                                                        &mut self
+                                                                ._timeoutPoints,
+                                                        PlotPoint::new(
+                                                                elapsed.max(
+                                                                        0.0,
+                                                                ),
+                                                                0.0,
+                                                        ),
+                                                );
+                                        }
+                                        if self._collectedRecords.len()
+                                                == MAX_LIVE_RECORDS
+                                        {
+                                                self._collectedRecords
+                                                        .pop_front();
+                                        }
+                                        self._collectedRecords
+                                                .push_back(record);
+                                }
+                                SessionEvent::Error(error) => {
+                                        self._workerError = Some(error);
+                                }
+                                SessionEvent::Finished(error) => {
+                                        if let Some(error) = error {
+                                                self._workerError = Some(error);
+                                        }
+                                        if self._state == AppState::Running {
+                                                self.SetStoppedTime();
+                                                self._state = AppState::Stopped;
+                                        }
+                                }
+                        }
+                }
+
+                if self._state == AppState::Running {
+                        ctx.request_repaint_after(Duration::from_secs(1));
+                }
         }
 
-        // Start ping test after validating and resolving address.
-        fn StartTest(&mut self) {
-                self.TryResolve();
-                let Some(ip) = self._resolvedIp else {
-                        return;
-                };
+        fn StartTest(&mut self, ctx: &egui::Context) {
+                self._pendingStart = true;
+                self._resolvedIp = None;
+                self.TryResolve(ctx);
+        }
 
+        fn StartResolvedTest(&mut self, ip: IpAddr, ctx: egui::Context) {
                 self._collectedRecords.clear();
+                self._totalRecords = 0;
+                self._statsAccumulator = StatsAccumulator::default();
+                self._lastStats = PingStats::default();
+                self._latencyPoints.clear();
+                self._timeoutPoints.clear();
+                self._maxPing = 0.0;
+                self._workerError = None;
                 self._saveStatusMsg = None;
                 self._lastSavedPath = None;
                 self._stopElapsedSecs = None;
 
                 let dur = Duration::from_secs_f64(self._intervalSecs);
-                let target = self._targetInput.clone();
-                match PingSession::Start(target, ip, dur) {
+                let target = self._targetInput.trim().to_string();
+                match PingSession::Start(target, ip, dur, ctx) {
                         Ok(session) => {
                                 self._session = Some(session);
                                 self._startTimeUtc = Some(Utc::now());
                                 self._state = AppState::Running;
                         }
-                        Err(e) => {
-                                self._resolutionError = Some(e);
+                        Err(error) => {
+                                self._workerError = Some(error);
+                                self._state = AppState::Stopped;
                         }
                 }
         }
 
-        // Stop active ping test and finalize captured records.
         fn StopTest(&mut self) {
+                if let Some(session) = &mut self._session {
+                        session.Stop();
+                }
+                self.SetStoppedTime();
+                self._state = AppState::Stopped;
+        }
+
+        fn SetStoppedTime(&mut self) {
+                if self._stopElapsedSecs.is_some() {
+                        return;
+                }
                 let start_utc = self._startTimeUtc.unwrap_or_else(Utc::now);
                 let diff = Utc::now() - start_utc;
                 let elapsed = diff.num_milliseconds() as f64 / 1000.0;
                 self._stopElapsedSecs = Some(elapsed);
-
-                if let Some(mut session) = self._session.take() {
-                        session.Stop();
-                        self._collectedRecords = session.getRecords();
-                        self._lastStats =
-                                CalculateStats(&self._collectedRecords);
-                }
-                self._state = AppState::Stopped;
         }
 
-        // Save captured ping records to a user-selected CSV file.
         fn SaveCsv(&mut self) {
                 if self._collectedRecords.is_empty() {
                         let err_text = "No ping records to save.".to_string();
@@ -203,11 +358,31 @@ impl PingApp {
                 let Some(path) = dialog.save_file() else {
                         return;
                 };
-                match ExportRecordsToCsv(&self._collectedRecords, &path) {
+                if self._session.as_ref().is_some_and(PingSession::isRunning) {
+                        self._saveStatusMsg = Some((
+                                "Wait for the session log to finish before exporting."
+                                        .to_string(),
+                                false,
+                        ));
+                        return;
+                }
+                let path = EnsureCsvExtension(path);
+                let result = self
+                        ._session
+                        .as_ref()
+                        .ok_or_else(|| {
+                                std::io::Error::other(
+                                        "Session log is unavailable",
+                                )
+                        })
+                        .and_then(|session| {
+                                ExportSessionCsv(session.csvPath(), &path)
+                        });
+                match result {
                         Ok(_) => {
                                 let msg = format!(
                                         "Saved {} rows to:\n{}",
-                                        self._collectedRecords.len(),
+                                        self._totalRecords,
                                         path.display()
                                 );
                                 self._lastSavedPath = Some(path);
@@ -220,18 +395,24 @@ impl PingApp {
                 }
         }
 
-        // Resolve input address to an IP address.
-        fn TryResolve(&mut self) {
-                match ResolveTarget(&self._targetInput) {
-                        Ok((_, ip)) => {
-                                self._resolvedIp = Some(ip);
-                                self._resolutionError = None;
-                        }
-                        Err(e) => {
-                                self._resolvedIp = None;
-                                self._resolutionError = Some(e);
-                        }
+        fn TryResolve(&mut self, ctx: &egui::Context) {
+                let target = self._targetInput.trim().to_string();
+                if let Err(error) = ValidateTargetSyntax(&target) {
+                        self._resolvedIp = None;
+                        self._resolutionError = Some(error);
+                        self._pendingStart = false;
+                        return;
                 }
+                let (tx, rx) = mpsc::channel();
+                let repaint_ctx = ctx.clone();
+                let worker_target = target.clone();
+                thread::spawn(move || {
+                        let _ = tx.send(ResolveTarget(&worker_target));
+                        repaint_ctx.request_repaint();
+                });
+                self._resolutionRx = Some(rx);
+                self._resolvingTarget = Some(target);
+                self._resolutionError = None;
         }
 }
 
@@ -307,18 +488,25 @@ impl PingApp {
                                 &mut self._targetInput,
                         )
                         .font(font)
+                        .char_limit(253)
                         .hint_text("e.g. 1.1.1.1, 8.8.8.8");
 
                         let text_box = ui.add_sized([440.0, 48.0], text_edit);
                         if text_box.changed() {
-                                self.TryResolve();
+                                self._resolvedIp = None;
+                                self._resolutionError = None;
+                                self._resolutionRx = None;
+                                self._resolvingTarget = None;
+                                self._pendingStart = false;
                         }
 
                         let btn_text = RichText::new("Resolve DNS").size(24.0);
                         let btn = egui::Button::new(btn_text)
                                 .min_size(Vec2::new(180.0, 48.0));
-                        if ui.add(btn).clicked() {
-                                self.TryResolve();
+                        if ui.add_enabled(self._resolutionRx.is_none(), btn)
+                                .clicked()
+                        {
+                                self.TryResolve(ui.ctx());
                         }
                 });
         }
@@ -337,7 +525,11 @@ impl PingApp {
                                 let btn_text = RichText::new(name).size(22.0);
                                 if ui.button(btn_text).clicked() {
                                         self._targetInput = host.to_string();
-                                        self.TryResolve();
+                                        self._resolvedIp = None;
+                                        self._resolutionError = None;
+                                        self._resolutionRx = None;
+                                        self._resolvingTarget = None;
+                                        self._pendingStart = false;
                                 }
                         }
                 });
@@ -345,7 +537,10 @@ impl PingApp {
 
         // Render DNS validation result message.
         fn RenderDnsStatusRow(&self, ui: &mut egui::Ui) {
-                if let Some(ip) = self._resolvedIp {
+                if self._resolutionRx.is_some() {
+                        ui.label(RichText::new("Resolving address...")
+                                .size(24.0));
+                } else if let Some(ip) = self._resolvedIp {
                         ui.horizontal(|ui| {
                                 let green = Color32::from_rgb(50, 200, 80);
                                 let prefix = RichText::new("Resolved IP:")
@@ -385,7 +580,8 @@ impl PingApp {
 
         // Render large prominent start test button.
         fn RenderBigRunButton(&mut self, ui: &mut egui::Ui) {
-                let can_run = !self._targetInput.trim().is_empty();
+                let can_run = !self._targetInput.trim().is_empty()
+                        && self._resolutionRx.is_none();
                 let btn_text = RichText::new("RUN PING TEST")
                         .size(24.0)
                         .color(Color32::WHITE)
@@ -397,7 +593,7 @@ impl PingApp {
                         .fill(green);
 
                 if ui.add_enabled(can_run, btn).clicked() {
-                        self.StartTest();
+                        self.StartTest(ui.ctx());
                 }
         }
 
@@ -439,11 +635,21 @@ impl PingApp {
                                         .strong());
                                 let info = format!(
                                         "Samples: {} | Interval: {:.1}s",
-                                        self._collectedRecords.len(),
-                                        self._intervalSecs,
+                                        self._totalRecords, self._intervalSecs,
                                 );
                                 ui.label(info);
                         });
+                        if let Some(error) = &self._workerError {
+                                ui.label(RichText::new(error).color(
+                                        Color32::from_rgb(255, 100, 100),
+                                ));
+                        }
+                        if let Some(session) = &self._session {
+                                ui.small(format!(
+                                        "Live CSV log: {}",
+                                        session.csvPath().display()
+                                ));
+                        }
                 });
         }
 
@@ -502,10 +708,20 @@ impl PingApp {
                                 .strong());
                         let count_text = format!(
                                 "Target: {} ({} samples captured)",
-                                self._targetInput,
-                                self._collectedRecords.len()
+                                self._targetInput, self._totalRecords
                         );
                         ui.label(count_text);
+                        if let Some(error) = &self._workerError {
+                                ui.label(RichText::new(error).color(
+                                        Color32::from_rgb(255, 100, 100),
+                                ));
+                        }
+                        if let Some(session) = &self._session {
+                                ui.small(format!(
+                                        "Live CSV log: {}",
+                                        session.csvPath().display()
+                                ));
+                        }
                 });
         }
 
@@ -528,7 +744,11 @@ impl PingApp {
                                 .min_size(Vec2::new(170.0, 36.0))
                                 .fill(blue);
 
-                        if ui.add(save_btn).clicked() {
+                        let export_ready = !self
+                                ._session
+                                .as_ref()
+                                .is_some_and(PingSession::isRunning);
+                        if ui.add_enabled(export_ready, save_btn).clicked() {
                                 self.SaveCsv();
                         }
                 });
@@ -582,12 +802,9 @@ impl PingApp {
         }
 
         // Render interactive latency graph pinned at (0, 0) with autoscaling.
-        fn RenderPlot(&self, ui: &mut egui::Ui) {
+        fn RenderPlot(&mut self, ui: &mut egui::Ui) {
                 let avail_h = ui.available_height().max(250.0);
                 let start_utc = self._startTimeUtc.unwrap_or_else(Utc::now);
-
-                let (pts, timeouts, max_ping) =
-                        BuildPlotData(&self._collectedRecords, start_utc);
 
                 let elapsed_now = match self._stopElapsedSecs {
                         Some(secs) => secs,
@@ -597,9 +814,12 @@ impl PingApp {
                         }
                 };
 
-                // Mathematical scaling: pin bottom-left at 0,0 and auto scale
                 let x_max = elapsed_now.max(DEFAULT_GRID_TIME_SECS);
-                let y_max = (max_ping * 1.05).max(DEFAULT_GRID_PING_MS);
+                let y_max = (self._maxPing * 1.05).max(DEFAULT_GRID_PING_MS);
+                let latency_points = self._latencyPoints.make_contiguous();
+                let timeout_points = self._timeoutPoints.make_contiguous();
+                let has_latency = !latency_points.is_empty();
+                let has_timeouts = !timeout_points.is_empty();
 
                 let plot = Plot::new("latency_plot")
                         .legend(Legend::default())
@@ -620,12 +840,11 @@ impl PingApp {
                                 [x_max, y_max],
                         );
                         plot_ui.set_plot_bounds(bounds);
-
-                        if !pts.is_empty() {
-                                DrawLatencySeries(plot_ui, pts);
+                        if has_latency {
+                                DrawLatencySeries(plot_ui, latency_points);
                         }
-                        if !timeouts.is_empty() {
-                                DrawTimeoutSeries(plot_ui, timeouts);
+                        if has_timeouts {
+                                DrawTimeoutSeries(plot_ui, timeout_points);
                         }
                 });
         }
@@ -652,56 +871,34 @@ fn RenderStatCard(
                 });
 }
 
-// Build plot coordinate points from raw ping records.
-fn BuildPlotData(
-        records: &[PingRecord],
-        start_utc: DateTime<Utc>,
-) -> (Vec<[f64; 2]>, Vec<[f64; 2]>, f64) {
-        let mut pts = Vec::with_capacity(records.len());
-        let mut timeouts = Vec::new();
-        let mut max_ping: f64 = 0.0;
-
-        for r in records {
-                let diff = r.getTimestamp() - start_utc;
-                let x = (diff.num_milliseconds() as f64 / 1000.0).max(0.0);
-
-                if let Some(ms) = r.getPingMs() {
-                        pts.push([x, ms]);
-                        if ms > max_ping {
-                                max_ping = ms;
-                        }
-                } else if r.isTimeout() {
-                        timeouts.push([x, 0.0]);
-                }
-        }
-
-        (pts, timeouts, max_ping)
-}
-
 // Draw line and sample dots for valid latency measurements.
-fn DrawLatencySeries(plot_ui: &mut egui_plot::PlotUi<'_>, pts: Vec<[f64; 2]>) {
+fn DrawLatencySeries<'a>(
+        plot_ui: &mut egui_plot::PlotUi<'a>,
+        pts: &'a [PlotPoint],
+) {
         let blue = Color32::from_rgb(33, 150, 243);
-        let line = Line::new("Ping Latency (ms)", PlotPoints::new(pts.clone()))
+        let line = Line::new("Ping Latency (ms)", PlotPoints::Borrowed(pts))
                 .color(blue)
                 .stroke(Stroke::new(2.0, blue));
         plot_ui.line(line);
 
         let light_blue = Color32::from_rgb(100, 200, 255);
-        let dots = Points::new("Samples", PlotPoints::new(pts))
+        let dots = Points::new("Samples", PlotPoints::Borrowed(pts))
                 .radius(3.0)
                 .color(light_blue);
         plot_ui.points(dots);
 }
 
 // Draw red indicator points along baseline for timed-out packets.
-fn DrawTimeoutSeries(
-        plot_ui: &mut egui_plot::PlotUi<'_>,
-        timeouts: Vec<[f64; 2]>,
+fn DrawTimeoutSeries<'a>(
+        plot_ui: &mut egui_plot::PlotUi<'a>,
+        timeouts: &'a [PlotPoint],
 ) {
         let red = Color32::from_rgb(255, 60, 60);
-        let points = Points::new("Timeouts (Lost)", PlotPoints::new(timeouts))
-                .radius(4.5)
-                .color(red);
+        let points =
+                Points::new("Timeouts (Lost)", PlotPoints::Borrowed(timeouts))
+                        .radius(4.5)
+                        .color(red);
         plot_ui.points(points);
 }
 
@@ -715,7 +912,55 @@ fn FormatMs(val: Option<f64>) -> String {
 
 // Format default file name for CSV export with timestamp.
 fn FormatDefaultCsvName(target: &str) -> String {
-        let clean_target = target.replace('.', "_").replace(':', "_");
+        let trimmed = target.trim();
+        let clean_target: String = trimmed
+                .chars()
+                .map(|ch| {
+                        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
+                        {
+                                ch
+                        } else {
+                                '_'
+                        }
+                })
+                .collect();
+        let clean_target = clean_target.trim_matches('_');
         let now_str = Local::now().format("%Y%m%d_%H%M%S");
         format!("ping_{}_{}.csv", clean_target, now_str)
+}
+
+fn EnsureCsvExtension(mut path: PathBuf) -> PathBuf {
+        path.set_extension("csv");
+        path
+}
+
+fn PushBounded<T>(items: &mut VecDeque<T>, item: T) {
+        if items.len() == MAX_PLOT_POINTS {
+                items.pop_front();
+        }
+        items.push_back(item);
+}
+
+#[cfg(test)]
+mod tests {
+        use super::*;
+
+        #[test]
+        fn csv_filename_sanitizes_target_and_trims_spaces() {
+                let file_name = FormatDefaultCsvName("  ../foo:bar  ");
+                assert!(file_name.starts_with("ping_foo_bar_"));
+                assert!(file_name.ends_with(".csv"));
+                assert!(file_name.chars().all(|ch| ch.is_ascii_alphanumeric()
+                        || ch == '_'
+                        || ch == '-'
+                        || ch == '.'));
+        }
+
+        #[test]
+        fn csv_extension_is_enforced() {
+                assert_eq!(
+                        EnsureCsvExtension(PathBuf::from("results.txt")),
+                        PathBuf::from("results.csv")
+                );
+        }
 }
