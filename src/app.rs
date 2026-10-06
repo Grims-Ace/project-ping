@@ -19,7 +19,7 @@ use std::time::Duration;
 // =============================================================================
 
 use chrono::{DateTime, Local, Utc};
-use eframe::egui::{self, Color32, RichText, Stroke, Vec2};
+use eframe::egui::{self, Color32, FontId, RichText, Stroke, Vec2};
 use egui_plot::{Legend, Line, Plot, PlotBounds, PlotPoints, Points};
 
 // =============================================================================
@@ -245,8 +245,7 @@ fn RenderHeader(ui: &mut egui::Ui) {
                 ui.add_space(8.0);
                 ui.heading(RichText::new("Project Ping").size(24.0).strong());
                 ui.label(RichText::new(
-                        "Cross-platform latency monitor with DNS \
-                                 resolution & CSV export",
+                        "A latency monitor, with dns resolution and csv logging.",
                 )
                 .size(13.0)
                 .color(Color32::from_gray(180)));
@@ -255,49 +254,70 @@ fn RenderHeader(ui: &mut egui::Ui) {
 }
 
 impl PingApp {
-        // Render target input panel, presets, and start button.
+        // Render centered target configuration card and run button.
         fn RenderConfigView(&mut self, ui: &mut egui::Ui) {
+                ui.add_space(20.0);
+                ui.vertical_centered(|ui| {
+                        let card_width = 720.0;
+                        ui.allocate_ui(Vec2::new(card_width, 0.0), |ui| {
+                                egui::Frame::group(ui.style())
+                                        .inner_margin(24.0)
+                                        .show(ui, |ui| {
+                                                self.RenderCardContents(ui);
+                                        });
+                        });
+
+                        ui.add_space(24.0);
+                        self.RenderBigRunButton(ui);
+                });
+        }
+
+        // Render contents of configuration card with 2x text scale.
+        fn RenderCardContents(&mut self, ui: &mut egui::Ui) {
+                let title = RichText::new("Target Configuration")
+                        .size(36.0)
+                        .strong();
+                ui.label(title);
+                ui.add_space(12.0);
+
+                self.RenderTargetInputRow(ui);
+                ui.add_space(10.0);
+
+                self.RenderPresetsRow(ui);
+                ui.add_space(12.0);
+
+                self.RenderDnsStatusRow(ui);
                 ui.add_space(16.0);
-                egui::Frame::group(ui.style()).inner_margin(16.0).show(
-                        ui,
-                        |ui| {
-                                ui.heading("Target Configuration");
-                                ui.add_space(8.0);
 
-                                self.RenderTargetInputRow(ui);
-                                ui.add_space(6.0);
-
-                                self.RenderPresetsRow(ui);
-                                ui.add_space(8.0);
-
-                                self.RenderDnsStatusRow(ui);
-                                ui.add_space(14.0);
-
-                                self.RenderSliderRow(ui);
-                        },
-                );
-
-                ui.add_space(24.0);
-                self.RenderBigRunButton(ui);
+                self.RenderSliderRow(ui);
         }
 
         // Render target address input field and manual resolve trigger.
         fn RenderTargetInputRow(&mut self, ui: &mut egui::Ui) {
-                ui.label("Enter an IP address or hostname to test:");
-                ui.horizontal(|ui| {
-                        let text_box = ui.add_sized(
-                                [320.0, 32.0],
-                                egui::TextEdit::singleline(
-                                        &mut self._targetInput,
-                                )
-                                .hint_text("e.g. 1.1.1.1, 8.8.8.8"),
-                        );
+                let prompt = RichText::new(
+                        "Enter an IP address or hostname to test:",
+                )
+                .size(28.0);
+                ui.label(prompt);
+                ui.add_space(4.0);
 
+                ui.horizontal(|ui| {
+                        let font = FontId::proportional(26.0);
+                        let text_edit = egui::TextEdit::singleline(
+                                &mut self._targetInput,
+                        )
+                        .font(font)
+                        .hint_text("e.g. 1.1.1.1, 8.8.8.8");
+
+                        let text_box = ui.add_sized([440.0, 48.0], text_edit);
                         if text_box.changed() {
                                 self.TryResolve();
                         }
 
-                        if ui.button("Resolve DNS").clicked() {
+                        let btn_text = RichText::new("Resolve DNS").size(24.0);
+                        let btn = egui::Button::new(btn_text)
+                                .min_size(Vec2::new(180.0, 48.0));
+                        if ui.add(btn).clicked() {
                                 self.TryResolve();
                         }
                 });
@@ -306,14 +326,16 @@ impl PingApp {
         // Render quick preset selection buttons.
         fn RenderPresetsRow(&mut self, ui: &mut egui::Ui) {
                 ui.horizontal_wrapped(|ui| {
-                        ui.label("Quick Presets:");
+                        let label = RichText::new("Quick Presets:").size(26.0);
+                        ui.label(label);
                         let presets = [
                                 ("Cloudflare (1.1.1.1)", "1.1.1.1"),
                                 ("Google (8.8.8.8)", "8.8.8.8"),
                                 ("Localhost (127.0.0.1)", "127.0.0.1"),
                         ];
                         for (name, host) in presets {
-                                if ui.button(name).clicked() {
+                                let btn_text = RichText::new(name).size(22.0);
+                                if ui.button(btn_text).clicked() {
                                         self._targetInput = host.to_string();
                                         self.TryResolve();
                                 }
@@ -326,51 +348,57 @@ impl PingApp {
                 if let Some(ip) = self._resolvedIp {
                         ui.horizontal(|ui| {
                                 let green = Color32::from_rgb(50, 200, 80);
-                                ui.label(RichText::new("Resolved IP:")
+                                let prefix = RichText::new("Resolved IP:")
+                                        .size(26.0)
                                         .color(green)
-                                        .strong());
-                                ui.label(RichText::new(ip.to_string())
+                                        .strong();
+                                ui.label(prefix);
+
+                                let ip_text = RichText::new(ip.to_string())
+                                        .size(26.0)
                                         .strong()
-                                        .monospace());
+                                        .monospace();
+                                ui.label(ip_text);
                         });
                 } else if let Some(ref err) = self._resolutionError {
                         let red = Color32::from_rgb(255, 100, 100);
-                        ui.label(RichText::new(err).color(red));
+                        let err_text = RichText::new(err).size(24.0).color(red);
+                        ui.label(err_text);
                 }
         }
 
         // Render ping interval duration slider.
         fn RenderSliderRow(&mut self, ui: &mut egui::Ui) {
                 ui.horizontal(|ui| {
-                        ui.label("Ping Interval:");
+                        let label = RichText::new("Ping Interval:").size(26.0);
+                        ui.label(label);
                         let range = MIN_INTERVAL_SECS..=MAX_INTERVAL_SECS;
-                        ui.add(egui::Slider::new(
+                        let slider = egui::Slider::new(
                                 &mut self._intervalSecs,
                                 range,
                         )
                         .step_by(STEP_INTERVAL_SECS)
-                        .suffix(" s"));
+                        .suffix(" s");
+                        ui.add(slider);
                 });
         }
 
         // Render large prominent start test button.
         fn RenderBigRunButton(&mut self, ui: &mut egui::Ui) {
-                ui.vertical_centered(|ui| {
-                        let can_run = !self._targetInput.trim().is_empty();
-                        let btn_text = RichText::new("RUN PING TEST")
-                                .size(20.0)
-                                .color(Color32::WHITE)
-                                .strong();
+                let can_run = !self._targetInput.trim().is_empty();
+                let btn_text = RichText::new("RUN PING TEST")
+                        .size(24.0)
+                        .color(Color32::WHITE)
+                        .strong();
 
-                        let green = Color32::from_rgb(46, 125, 50);
-                        let btn = egui::Button::new(btn_text)
-                                .min_size(Vec2::new(280.0, 56.0))
-                                .fill(green);
+                let green = Color32::from_rgb(46, 125, 50);
+                let btn = egui::Button::new(btn_text)
+                        .min_size(Vec2::new(320.0, 60.0))
+                        .fill(green);
 
-                        if ui.add_enabled(can_run, btn).clicked() {
-                                self.StartTest();
-                        }
-                });
+                if ui.add_enabled(can_run, btn).clicked() {
+                        self.StartTest();
+                }
         }
 
         // Render active test status bar, stop button, and plot.
