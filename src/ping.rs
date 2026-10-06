@@ -1,8 +1,14 @@
 // =============================================================================
-// Ping execution engine with DNS resolution, metrics, and CSV export.
+// =============================================================================
+// Ping worker, session metrics, and CSV export.
+// =============================================================================
 // =============================================================================
 
 #![allow(non_snake_case)]
+
+// =============================================================================
+// Platform and Runtime Libraries
+// =============================================================================
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
@@ -18,11 +24,20 @@ use std::time::Duration;
 #[cfg(windows)]
 use std::time::Instant;
 
+// =============================================================================
+// Third-Party Libraries
+// =============================================================================
+
 use chrono::{DateTime, Utc};
 use eframe::egui;
 #[cfg(not(windows))]
 use pinger::{PingOptions, PingResult};
 
+// =============================================================================
+// Types and Interfaces
+// =============================================================================
+
+// Store one ping result and its timestamp.
 #[derive(Debug, Clone)]
 pub struct PingRecord {
         pub _timestamp: DateTime<Utc>,
@@ -30,6 +45,7 @@ pub struct PingRecord {
         pub _isTimeout: bool,
 }
 
+// Store aggregate metrics for one ping session.
 #[derive(Debug, Clone, Default)]
 pub struct PingStats {
         pub total_sent: usize,
@@ -42,27 +58,46 @@ pub struct PingStats {
         pub jitter_ms: Option<f64>,
 }
 
+// Pass ping results and worker status to the UI.
 pub enum SessionEvent {
         Record(PingRecord),
         Error(String),
         Finished(Option<String>),
 }
 
+// Own the worker state and live session log.
 pub struct PingSession {
         _stopSignal: Arc<AtomicBool>,
         _running: Arc<AtomicBool>,
         _events: Receiver<SessionEvent>,
-        _handle: Option<thread::JoinHandle<()>>,
         _target: String,
         _resolvedIp: IpAddr,
         _csvPath: PathBuf,
 }
+
+// Store running metrics without retaining all ping results.
+#[derive(Default)]
+pub struct StatsAccumulator {
+        stats: PingStats,
+        latency_sum: f64,
+        jitter_sum: f64,
+        jitter_samples: usize,
+        previous_latency: Option<f64>,
+}
+
+// =============================================================================
+// Constants and Limits
+// =============================================================================
 
 #[cfg(not(windows))]
 const POLL_TIMEOUT_MS: u64 = 100;
 #[cfg(windows)]
 const STOP_POLL_MS: u64 = 100;
 static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+// =============================================================================
+// Public Accessors
+// =============================================================================
 
 impl PingRecord {
         pub fn getTimestamp(&self) -> DateTime<Utc> {
@@ -80,7 +115,6 @@ impl PingRecord {
         pub fn new(
                 timestamp: DateTime<Utc>,
                 ping_ms: Option<f64>,
-                _raw_msg: String,
                 is_timeout: bool,
         ) -> Self {
                 Self {
@@ -92,6 +126,7 @@ impl PingRecord {
 }
 
 impl PingStats {
+        // Return packet loss as a percentage.
         pub fn getPacketLossPct(&self) -> f64 {
                 if self.total_sent == 0 {
                         return 0.0;
@@ -100,16 +135,8 @@ impl PingStats {
         }
 }
 
-#[derive(Default)]
-pub struct StatsAccumulator {
-        stats: PingStats,
-        latency_sum: f64,
-        jitter_sum: f64,
-        jitter_samples: usize,
-        previous_latency: Option<f64>,
-}
-
 impl StatsAccumulator {
+        // Update session metrics with one ping result.
         pub fn push(&mut self, record: &PingRecord) {
                 self.stats.total_sent += 1;
                 if record._isTimeout {
@@ -141,32 +168,38 @@ impl StatsAccumulator {
                 self.previous_latency = Some(ms);
         }
 
-        pub fn snapshot(&self) -> PingStats {
-                self.stats.clone()
+        pub fn getStats(&self) -> &PingStats {
+                &self.stats
         }
 }
 
 impl PingSession {
+        // Return the original target text.
         pub fn getTarget(&self) -> &str {
                 &self._target
         }
 
+        // Return the address used by the ping worker.
         pub fn getResolvedIp(&self) -> IpAddr {
                 self._resolvedIp
         }
 
+        // Check whether the ping worker is active.
         pub fn isRunning(&self) -> bool {
                 self._running.load(Ordering::Acquire)
         }
 
+        // Return the path to the live session log.
         pub fn csvPath(&self) -> &Path {
                 &self._csvPath
         }
 
+        // Read one worker event without waiting.
         pub fn tryRecv(&self) -> Result<SessionEvent, mpsc::TryRecvError> {
                 self._events.try_recv()
         }
 
+        // Start ping collection and write each result to a session log.
         pub fn Start(
                 target: String,
                 resolved_ip: IpAddr,
@@ -191,7 +224,7 @@ impl PingSession {
                 let worker_stop = Arc::clone(&stop_signal);
                 let worker_running = Arc::clone(&running);
 
-                let handle = thread::spawn(move || {
+                thread::spawn(move || {
                         let result = std::panic::catch_unwind(
                                 std::panic::AssertUnwindSafe(|| {
                                         ExecutePingLoop(
@@ -224,16 +257,15 @@ impl PingSession {
                         _stopSignal: stop_signal,
                         _running: running,
                         _events: event_rx,
-                        _handle: Some(handle),
                         _target: target,
                         _resolvedIp: resolved_ip,
                         _csvPath: csv_path,
                 })
         }
 
-        pub fn Stop(&mut self) {
+        // Request worker shutdown without waiting for the worker thread.
+        pub fn Stop(&self) {
                 self._stopSignal.store(true, Ordering::Release);
-                self._handle.take();
         }
 }
 
@@ -243,21 +275,18 @@ impl Drop for PingSession {
         }
 }
 
+// =============================================================================
+// Primary Operations
+// =============================================================================
+
+// Validate the target and resolve its IP address.
 pub fn ResolveTarget(target: &str) -> Result<(String, IpAddr), String> {
         let trimmed = target.trim();
-        if trimmed.is_empty() {
-                return Err("Address cannot be empty".to_string());
-        }
-        if trimmed.len() > 253 {
-                return Err(
-                        "Address must be 253 characters or fewer".to_string()
-                );
-        }
+        ValidateTargetSyntax(trimmed)?;
         if let Ok(ip) = trimmed.parse::<IpAddr>() {
                 return Ok((trimmed.to_string(), ip));
         }
 
-        ValidateTargetSyntax(trimmed)?;
         let addr_spec = format!("{}:0", trimmed);
         let mut addrs = addr_spec.to_socket_addrs().map_err(|e| {
                 format!("Failed to resolve '{}': {}", trimmed, e)
@@ -268,6 +297,7 @@ pub fn ResolveTarget(target: &str) -> Result<(String, IpAddr), String> {
         Ok((trimmed.to_string(), socket_addr.ip()))
 }
 
+// Reject malformed IP addresses and hostnames before DNS lookup.
 pub fn ValidateTargetSyntax(host: &str) -> Result<(), String> {
         if host.is_empty() {
                 return Err("Address cannot be empty".to_string());
@@ -298,14 +328,16 @@ pub fn ValidateTargetSyntax(host: &str) -> Result<(), String> {
         Ok(())
 }
 
+// Calculate session metrics from a slice of ping results.
 pub fn CalculateStats(records: &[PingRecord]) -> PingStats {
         let mut accumulator = StatsAccumulator::default();
         for record in records {
                 accumulator.push(record);
         }
-        accumulator.snapshot()
+        accumulator.stats
 }
 
+// Export ping results to a CSV file without exposing partial output.
 pub fn ExportRecordsToCsv(
         records: &[PingRecord],
         path: &Path,
@@ -319,6 +351,7 @@ pub fn ExportRecordsToCsv(
         })
 }
 
+// Copy the complete session log to its selected export path.
 pub fn ExportSessionCsv(staged_path: &Path, path: &Path) -> io::Result<()> {
         WriteCsvAtomically(path, |writer| {
                 let mut source = File::open(staged_path)?;
@@ -327,6 +360,11 @@ pub fn ExportSessionCsv(staged_path: &Path, path: &Path) -> io::Result<()> {
         })
 }
 
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+// Write a complete CSV file before replacing the destination.
 fn WriteCsvAtomically(
         path: &Path,
         write_contents: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
@@ -349,6 +387,7 @@ fn WriteCsvAtomically(
         result
 }
 
+// Create a unique temporary path beside the destination.
 fn TemporarySiblingPath(path: &Path) -> PathBuf {
         let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
         let file_name = path
@@ -362,6 +401,7 @@ fn TemporarySiblingPath(path: &Path) -> PathBuf {
         ))
 }
 
+// Create a unique session log in the system temporary directory.
 fn CreateSessionCsv() -> Result<(PathBuf, File), String> {
         loop {
                 let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
@@ -387,6 +427,7 @@ fn CreateSessionCsv() -> Result<(PathBuf, File), String> {
         }
 }
 
+// Run the platform ping worker and publish its results.
 fn ExecutePingLoop(
         stop_signal: Arc<AtomicBool>,
         writer: &mut BufWriter<File>,
@@ -403,6 +444,7 @@ fn ExecutePingLoop(
 }
 
 #[cfg(not(windows))]
+// Collect ping results from the platform pinger.
 fn ExecutePingerLoop(
         stop_signal: Arc<AtomicBool>,
         writer: &mut BufWriter<File>,
@@ -437,7 +479,7 @@ fn ExecutePingerLoop(
                         Err(RecvTimeoutError::Disconnected) => {
                                 if !stop_signal.load(Ordering::Acquire) {
                                         exit_error = Some(
-                                                "Ping result stream disconnected unexpectedly."
+                                                "Ping stream disconnected."
                                                         .to_string(),
                                         );
                                 }
@@ -483,6 +525,7 @@ fn ExecutePingerLoop(
 }
 
 #[cfg(windows)]
+// Send pings at a fixed interval with interruptible waits.
 fn ExecuteWindowsPingLoop(
         stop_signal: Arc<AtomicBool>,
         writer: &mut BufWriter<File>,
@@ -518,15 +561,9 @@ fn ExecuteWindowsPingLoop(
                         Ok(rtt_ms) => PingRecord::new(
                                 timestamp,
                                 Some(rtt_ms as f64),
-                                String::new(),
                                 false,
                         ),
-                        Err(_) => PingRecord::new(
-                                timestamp,
-                                None,
-                                String::new(),
-                                true,
-                        ),
+                        Err(_) => PingRecord::new(timestamp, None, true),
                 };
                 if !RecordAndPublish(
                         writer,
@@ -558,6 +595,7 @@ fn ExecuteWindowsPingLoop(
         ctx.request_repaint();
 }
 
+// Persist a ping result and notify the UI.
 fn RecordAndPublish(
         writer: &mut BufWriter<File>,
         events: &Sender<SessionEvent>,
@@ -566,17 +604,14 @@ fn RecordAndPublish(
         log_failed: &mut bool,
         exit_error: &mut Option<String>,
 ) -> bool {
-        if !*log_failed {
-                if let Err(error) = WriteCsvRecord(writer, &record)
+        if !*log_failed
+                && let Err(error) = WriteCsvRecord(writer, &record)
                         .and_then(|_| writer.flush())
-                {
-                        let message =
-                                format!("Session CSV write failed: {error}");
-                        let _ = events
-                                .send(SessionEvent::Error(message.clone()));
-                        *exit_error = Some(message);
-                        *log_failed = true;
-                }
+        {
+                let message = format!("Session CSV write failed: {error}");
+                let _ = events.send(SessionEvent::Error(message.clone()));
+                *exit_error = Some(message);
+                *log_failed = true;
         }
         if events.send(SessionEvent::Record(record)).is_err() {
                 return false;
@@ -586,6 +621,7 @@ fn RecordAndPublish(
 }
 
 #[cfg(not(windows))]
+// Convert a platform result into a timestamped ping record.
 fn ConvertPingResult(res: PingResult) -> Option<PingRecord> {
         match res {
                 PingResult::Pong(duration, _) => {
@@ -593,29 +629,19 @@ fn ConvertPingResult(res: PingResult) -> Option<PingRecord> {
                         let timestamp = Utc::now()
                                 - chrono::Duration::from_std(duration)
                                         .unwrap_or_default();
-                        Some(PingRecord::new(
-                                timestamp,
-                                Some(ms),
-                                String::new(),
-                                false,
-                        ))
+                        Some(PingRecord::new(timestamp, Some(ms), false))
                 }
-                PingResult::Timeout(_) => Some(PingRecord::new(
-                        Utc::now(),
-                        None,
-                        String::new(),
-                        true,
-                )),
-                PingResult::Unknown(_) => Some(PingRecord::new(
-                        Utc::now(),
-                        None,
-                        String::new(),
-                        false,
-                )),
+                PingResult::Timeout(_) => {
+                        Some(PingRecord::new(Utc::now(), None, true))
+                }
+                PingResult::Unknown(_) => {
+                        Some(PingRecord::new(Utc::now(), None, false))
+                }
                 PingResult::PingExited(_, _) => None,
         }
 }
 
+// Write one timestamp and latency pair to a CSV stream.
 fn WriteCsvRecord(
         writer: &mut impl Write,
         record: &PingRecord,
@@ -627,6 +653,10 @@ fn WriteCsvRecord(
                 writeln!(writer, "{timestamp},timeout")
         }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -661,10 +691,10 @@ mod tests {
         fn test_compute_stats() {
                 let t0 = Utc::now();
                 let records = vec![
-                        PingRecord::new(t0, Some(10.0), String::new(), false),
-                        PingRecord::new(t0, Some(20.0), String::new(), false),
-                        PingRecord::new(t0, None, String::new(), true),
-                        PingRecord::new(t0, Some(30.0), String::new(), false),
+                        PingRecord::new(t0, Some(10.0), false),
+                        PingRecord::new(t0, Some(20.0), false),
+                        PingRecord::new(t0, None, true),
+                        PingRecord::new(t0, Some(30.0), false),
                 ];
                 let stats = CalculateStats(&records);
                 assert_eq!(stats.total_sent, 4);
@@ -687,8 +717,8 @@ mod tests {
                 ));
                 let t0 = Utc::now();
                 let records = vec![
-                        PingRecord::new(t0, Some(15.234), String::new(), false),
-                        PingRecord::new(t0, None, String::new(), true),
+                        PingRecord::new(t0, Some(15.234), false),
+                        PingRecord::new(t0, None, true),
                 ];
                 ExportRecordsToCsv(&records, &path)
                         .expect("CSV export succeeds");

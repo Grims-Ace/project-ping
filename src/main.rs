@@ -8,13 +8,18 @@
 #![allow(non_snake_case)]
 
 // =============================================================================
+// Platform and Runtime Libraries
+// =============================================================================
+
+use std::fs::OpenOptions;
+use std::io::Write;
+
+// =============================================================================
 // Third-Party Libraries
 // =============================================================================
 
 use eframe::NativeOptions;
 use eframe::egui::ViewportBuilder;
-use std::fs::OpenOptions;
-use std::io::Write;
 
 // =============================================================================
 // Domain Modules
@@ -46,6 +51,7 @@ fn main() -> eframe::Result<()> {
         )
 }
 
+// Write panic details to a file when no console is available.
 fn InstallPanicLog() {
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |panic_info| {
