@@ -51,7 +51,7 @@ fn main() -> eframe::Result<()> {
         )
 }
 
-// Write panic details to a file when no console is available.
+// Write panic details to a file if no console is available.
 fn InstallPanicLog() {
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |panic_info| {
